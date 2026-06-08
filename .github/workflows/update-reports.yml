@@ -16,7 +16,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      # max-parallel: 1
+      max-parallel: 2
       matrix:
         env: ${{ fromJson(vars.MINIO_ENVS) }}
 
