@@ -16,9 +16,29 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # One WireGuard peer per concurrent job. Never raise this above the number
+      # of WIREGUARD_CONF_<n> secrets that exist.
+      max-parallel: 4
       matrix:
         env: ${{ fromJson(vars.MINIO_ENVS) }}
+        # Pins each env to a WireGuard slot. Every env in MINIO_ENVS must appear
+        # here, or its job has no tunnel config and fails the guard below.
+        include:
+          - { env: collab,   wg: 1 }
+          - { env: dev,      wg: 1 }
+          - { env: released, wg: 2 }
+          - { env: qa21,     wg: 2 }
+          - { env: qa11new,  wg: 3 }
+          - { env: dev11,    wg: 3 }
+          - { env: qa11,     wg: 4 }
+          - { env: qaj21,    wg: 4 }
+
+    # Serialises jobs that share a WireGuard key. Without this, `max-parallel`
+    # alone lets a freed slot start a job whose key is still in use, which is the
+    # peer-roaming collision this whole change exists to prevent.
+    concurrency:
+      group: wg-slot-${{ matrix.wg }}
+      cancel-in-progress: false
 
     env:
       MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.env)] }}
@@ -51,10 +71,26 @@ jobs:
         run: sudo apt-get install -y wireguard
 
       - name: Configure WireGuard
+        env:
+          WG_CONF: ${{ secrets[format('WIREGUARD_CONF_{0}', matrix.wg)] }}
         run: |
-          echo "${{ secrets.WIREGUARD_CONF }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          if [ -z "${{ matrix.wg }}" ]; then
+            echo "env '${{ matrix.env }}' has no wg slot in the matrix include block."
+            exit 1
+          fi
+          if [ -z "$WG_CONF" ]; then
+            echo "Secret WIREGUARD_CONF_${{ matrix.wg }} is empty or missing."
+            exit 1
+          fi
+          printf '%s\n' "$WG_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
+          echo "env '${{ matrix.env }}' is using WireGuard slot ${{ matrix.wg }}."
+          # Public keys and tunnel addresses are not secret. Logging them is how we
+          # prove the four slots are four DISTINCT peers: if two slots print the
+          # same key or address, they share an identity and will still roam.
+          echo "Slot ${{ matrix.wg }} public key: $(sudo wg show wg0 public-key)"
+          echo "Slot ${{ matrix.wg }} address:    $(ip -4 -o addr show wg0 | awk '{print $4}')"
 
       - name: Verify WireGuard tunnel
         if: github.event_name == 'workflow_dispatch'
@@ -312,6 +348,11 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.TEST_AUTOMATION_SLACK_WEBHOOK }}
         run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook configured; skipping notification."
+            exit 0
+          fi
+
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE=$(date +'%d %b %Y')
 
