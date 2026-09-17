@@ -17,6 +17,9 @@ except Exception:
 
 env_name = os.getenv("MINIO_ENV") or os.getenv("MINIO_ALIAS")
 env_list = os.getenv("MINIO_ENVS")
+# mc aliases must match ^[A-Za-z][A-Za-z0-9_-]*$, so an env such as 131ga is reached through a
+# separate alias. Only honoured for a single env; the env name is still used for the CSV and status.
+mc_alias_override = os.getenv("MINIO_MC_ALIAS") if env_name else None
 
 if env_name:
     MINIO_ALIASES = [env_name]
@@ -112,6 +115,7 @@ def append_row(all_data_by_date, date_key, module, row):
 
 
 for alias in MINIO_ALIASES:
+    mc_alias = mc_alias_override or alias
     try:
         log(alias, "Starting MinIO scan")
         csv_filename   = f"{alias}.csv"
@@ -123,7 +127,7 @@ for alias in MINIO_ALIASES:
             folders = []
 
             if bucket == "dslreports":
-                entries = run_mc_json_lines(alias, f"mc ls --json {alias}/dslreports/full/")
+                entries = run_mc_json_lines(alias, f"mc ls --json {mc_alias}/dslreports/full/")
                 log(alias, f"dslreports/full entries scanned: {len(entries)}")
 
                 for info in entries:
@@ -153,7 +157,7 @@ for alias in MINIO_ALIASES:
                 continue
 
             if bucket == "uitestrig":
-                entries = run_mc_json_lines(alias, f"mc ls --json {alias}/{bucket}/")
+                entries = run_mc_json_lines(alias, f"mc ls --json {mc_alias}/{bucket}/")
                 log(alias, f"uitestrig root entries scanned: {len(entries)}")
 
                 for info in entries:
@@ -180,7 +184,7 @@ for alias in MINIO_ALIASES:
                     matched_rows += 1
                     bucket_stats[bucket] += 1
 
-            folder_entries = run_mc_json_lines(alias, f"mc ls --json {alias}/{bucket}/")
+            folder_entries = run_mc_json_lines(alias, f"mc ls --json {mc_alias}/{bucket}/")
             for info in folder_entries:
                 try:
                     folders.append(info["key"].strip("/"))
@@ -193,7 +197,7 @@ for alias in MINIO_ALIASES:
 
             for folder in folders:
                 if bucket == "uitestrig" and folder.lower() == "pmpui":
-                    for info in run_mc_json_lines(alias, f"mc ls --json {alias}/{bucket}/{folder}/"):
+                    for info in run_mc_json_lines(alias, f"mc ls --json {mc_alias}/{bucket}/{folder}/"):
                         try:
                             fn       = info["key"]
                             date_key = date_key_from_minio_ts(info["lastModified"])
@@ -211,7 +215,7 @@ for alias in MINIO_ALIASES:
                         bucket_stats[bucket] += 1
                     continue
 
-                for info in run_mc_json_lines(alias, f"mc ls --json {alias}/{bucket}/{folder}/"):
+                for info in run_mc_json_lines(alias, f"mc ls --json {mc_alias}/{bucket}/{folder}/"):
                     try:
                         fn       = info["key"]
                         date_key = date_key_from_minio_ts(info["lastModified"])

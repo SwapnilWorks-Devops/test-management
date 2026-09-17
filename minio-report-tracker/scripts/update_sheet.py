@@ -384,7 +384,7 @@ def main():
         # Add failure notes for envs that failed entirely (no CSV produced)
         if os.path.isdir(STATUS_DIR):
             for sf in sorted(f for f in os.listdir(STATUS_DIR) if f.endswith(".json")):
-                alias = sf.replace("status_", "").replace(".json", "")
+                alias = sf.removeprefix("status_").removesuffix(".json")
                 try:
                     with open(os.path.join(STATUS_DIR, sf)) as f:
                         data = json.load(f)
