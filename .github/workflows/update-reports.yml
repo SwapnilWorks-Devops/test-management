@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '50 3 * * 1-5'
   workflow_dispatch:
+    inputs:
+      envs:
+        description: 'FORK TEST ONLY: JSON array used instead of vars.MINIO_ENVS'
+        required: false
+        type: string
 
 jobs:
 
@@ -22,7 +27,7 @@ jobs:
       - name: Resolve MINIO_ENVS
         id: resolve
         env:
-          MINIO_ENVS: ${{ vars.MINIO_ENVS }}
+          MINIO_ENVS: ${{ inputs.envs || vars.MINIO_ENVS }}
         run: |
           if ! jq -e 'type == "array"' <<< "$MINIO_ENVS" > /dev/null 2>&1; then
             echo "::error::MINIO_ENVS must be a JSON array of env names, got: $MINIO_ENVS"
@@ -75,6 +80,8 @@ jobs:
 
     strategy:
       fail-fast: false
+      # FORK TEST ONLY: one job at a time so runners never share the WireGuard key concurrently
+      max-parallel: 1
       matrix: ${{ fromJson(needs.resolve-envs.outputs.matrix) }}
 
     env:
@@ -86,7 +93,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: daily-automation-reports
+          ref: test-minio-env-names-scripts
 
       - name: Reset per-env collected files
         run: |
@@ -276,7 +283,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: daily-automation-reports
+          ref: test-minio-env-names-scripts
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -429,6 +436,13 @@ jobs:
                 }
               ]
             }')
+
+          # FORK TEST ONLY: no webhook here, so show what would have been posted
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook configured; payload that would be sent:"
+            echo "$PAYLOAD"
+            exit 0
+          fi
 
           curl -fsSL -X POST -H 'Content-type: application/json' \
                --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
