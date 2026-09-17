@@ -94,7 +94,9 @@ for alias in MINIO_ALIASES:
                 for info in entries:
                     try:
                         fn       = info["key"]
-                        if fn.startswith("ExtentReport-"):
+                        # every run also writes a -full-error- report with the same counts but no KI/I;
+                        # it sorts before -full-run- and append_row keeps the first row, so skip it
+                        if fn.startswith("ExtentReport-") or "-full-error-" in fn:
                             continue
                         date_key = date_key_from_minio_ts(info["lastModified"])
                     except (KeyError, ValueError):
