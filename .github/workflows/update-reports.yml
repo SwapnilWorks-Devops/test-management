@@ -7,22 +7,80 @@ on:
 
 jobs:
 
+  # Validates MINIO_ENVS and derives, per env, the secret-name key and an mc alias.
+  # Secret names only allow [A-Z0-9_] and mc aliases must match ^[A-Za-z][A-Za-z0-9_-]*$,
+  # so an env such as 131ga or qa-1.3 cannot be used as-is for either.
+  resolve-envs:
+    name: Resolve environments
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:  ${{ steps.resolve.outputs.matrix }}
+      count:   ${{ steps.resolve.outputs.count }}
+      invalid: ${{ steps.resolve.outputs.invalid }}
+
+    steps:
+      - name: Resolve MINIO_ENVS
+        id: resolve
+        env:
+          MINIO_ENVS: ${{ vars.MINIO_ENVS }}
+        run: |
+          if ! jq -e 'type == "array"' <<< "$MINIO_ENVS" > /dev/null 2>&1; then
+            echo "::error::MINIO_ENVS must be a JSON array of env names, got: $MINIO_ENVS"
+            exit 1
+          fi
+
+          # name:  letters, digits, dots, hyphens, underscores; no leading dot (upload-artifact skips hidden files)
+          # key:   uppercased, anything outside A-Z0-9 becomes "_"  ->  MINIO_<key>_URL / _USER / _PASSWORD
+          # alias: the name itself when mc accepts it, otherwise env_<name> with dots turned into "_"
+          RESOLVED=$(jq -c '
+            reduce .[] as $name ({include: [], invalid: [], seen: {}};
+              if ($name | type) != "string" or ($name | test("^[A-Za-z0-9_-][A-Za-z0-9._-]*$") | not) then
+                .invalid += [{env: ($name | tostring),
+                              reason: "invalid name, use letters, digits, dots, hyphens and underscores, not starting with a dot"}]
+              else
+                ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")) as $key
+                | if .seen[$key] == null then
+                    .seen[$key] = $name
+                    | .include += [{
+                        env:   $name,
+                        key:   $key,
+                        alias: (if ($name | test("^[A-Za-z][A-Za-z0-9_-]*$")) then $name
+                                else "env_" + ($name | gsub("[^A-Za-z0-9_-]"; "_")) end)
+                      }]
+                  elif .seen[$key] == $name then .
+                  else
+                    .invalid += [{env: $name,
+                                  reason: "shares the MINIO_\($key)_* secrets with \(.seen[$key]), rename one of them"}]
+                  end
+              end)
+            | {include, invalid}' <<< "$MINIO_ENVS")
+
+          jq -r '.include[] | "\(.env): secrets MINIO_\(.key)_*, mc alias \(.alias)"' <<< "$RESOLVED"
+          jq -r '.invalid[] | "::error::MINIO_ENVS entry \(.env | @json) skipped: \(.reason)"' <<< "$RESOLVED"
+
+          {
+            echo "matrix=$(jq -c '{include}' <<< "$RESOLVED")"
+            echo "count=$(jq '.include | length' <<< "$RESOLVED")"
+            echo "invalid=$(jq -c '.invalid' <<< "$RESOLVED")"
+          } >> "$GITHUB_OUTPUT"
+
   # Runs once per env in MINIO_ENVS in parallel — connects to MinIO via WireGuard and generates a CSV
   per-env:
     name: "env: ${{ matrix.env }}"
+    needs: resolve-envs
+    if: needs.resolve-envs.outputs.count != '0'
     runs-on: ubuntu-latest
     environment:
       name: daily-automation-reports
 
     strategy:
       fail-fast: false
-      matrix:
-        env: ${{ fromJson(vars.MINIO_ENVS) }}
+      matrix: ${{ fromJson(needs.resolve-envs.outputs.matrix) }}
 
     env:
-      MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.env)] }}
-      MINIO_USER:     ${{ secrets[format('MINIO_{0}_USER',     matrix.env)] }}
-      MINIO_PASSWORD: ${{ secrets[format('MINIO_{0}_PASSWORD', matrix.env)] }}
+      MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.key)] }}
+      MINIO_USER:     ${{ secrets[format('MINIO_{0}_USER',     matrix.key)] }}
+      MINIO_PASSWORD: ${{ secrets[format('MINIO_{0}_PASSWORD', matrix.key)] }}
 
     steps:
       - name: Checkout repo
@@ -81,11 +139,11 @@ jobs:
       - name: Configure MinIO Alias
         id: configure_minio
         run: |
-          ALIAS="${{ matrix.env }}"
-          echo "Configuring mc alias '$ALIAS' -> $MINIO_URL"
+          ALIAS="${{ matrix.alias }}"
+          echo "Configuring mc alias '$ALIAS' for env '${{ matrix.env }}' -> $MINIO_URL"
 
           if [ -z "$MINIO_URL" ] || [ -z "$MINIO_USER" ] || [ -z "$MINIO_PASSWORD" ]; then
-            REASON="One or more MinIO secrets are empty for env '$ALIAS'. Expected: MINIO_${ALIAS^^}_URL / _USER / _PASSWORD"
+            REASON="One or more MinIO secrets are empty for env '${{ matrix.env }}'. Expected: MINIO_${{ matrix.key }}_URL / _USER / _PASSWORD"
             echo "$REASON"
             echo "$REASON" > /tmp/step_failure_reason.txt
             exit 1
@@ -97,7 +155,7 @@ jobs:
       - name: Debug MinIO raw listings
         if: github.event_name == 'workflow_dispatch'
         run: |
-          ALIAS="${{ matrix.env }}"
+          ALIAS="${{ matrix.alias }}"
           echo "== $ALIAS/dslreports/full =="
           timeout 15s mc ls --json "$ALIAS/dslreports/full/" || true
           echo ""
@@ -114,6 +172,7 @@ jobs:
         id: run_csv_generation
         run: |
           export MINIO_ENV="${{ matrix.env }}"
+          export MINIO_MC_ALIAS="${{ matrix.alias }}"
           python minio-report-tracker/scripts/update_csv.py
 
       - name: Debug generated outputs
@@ -207,7 +266,7 @@ jobs:
   # Waits for all per-env jobs, merges CSVs, generates XLSX, updates Google Sheet, and notifies Slack on failure
   summary:
     name: Summary
-    needs: per-env
+    needs: [resolve-envs, per-env]
     runs-on: ubuntu-latest
     if: always()
     environment:
@@ -265,6 +324,9 @@ jobs:
           ls -la status || true
 
       - name: Generate workflow summary
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve-envs.result }}
+          INVALID_ENVS:   ${{ needs.resolve-envs.outputs.invalid }}
         run: |
           echo "## MinIO Environment Summary" >> $GITHUB_STEP_SUMMARY
 
@@ -281,7 +343,8 @@ jobs:
             echo "SUCCESS_ENVS=" >> $GITHUB_ENV
           else
             for file in "${status_files[@]}"; do
-              ENV_NAME=$(basename "$file" | sed 's/status_//' | sed 's/.json//')
+              ENV_NAME=$(basename "$file" .json)
+              ENV_NAME="${ENV_NAME#status_}"
               if python -c "import json,sys; data=json.load(open(sys.argv[1])); raise SystemExit(0 if sys.argv[2] in data.get('success',[]) else 1)" "$file" "$ENV_NAME"
               then
                 echo "OK $ENV_NAME" >> $GITHUB_STEP_SUMMARY
@@ -292,6 +355,17 @@ jobs:
               fi
             done
           fi
+
+          # MINIO_ENVS entries that never got a job
+          if [ "$RESOLVE_RESULT" != "success" ]; then
+            echo "FAILED MINIO_ENVS (not a JSON array of env names)" >> $GITHUB_STEP_SUMMARY
+            FAILED="$FAILED MINIO_ENVS"
+          fi
+          while IFS=$'\t' read -r INVALID_NAME INVALID_REASON; do
+            [ -n "$INVALID_NAME" ] || continue
+            echo "FAILED $INVALID_NAME ($INVALID_REASON)" >> $GITHUB_STEP_SUMMARY
+            FAILED="$FAILED $INVALID_NAME"
+          done < <(jq -r '.[] | [(.env | gsub("\\s"; "_")), .reason] | @tsv' <<< "${INVALID_ENVS:-[]}")
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Failed Environments" >> $GITHUB_STEP_SUMMARY

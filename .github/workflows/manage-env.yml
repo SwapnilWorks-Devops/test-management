@@ -11,7 +11,7 @@ on:
           - add
           - remove
       env_name:
-        description: 'Environment name (e.g. qa22) — must be lowercase'
+        description: 'Environment name (e.g. qa22, 131ga, qa-1.3) — must be lowercase'
         required: true
         type: string
       minio_url:
@@ -40,8 +40,8 @@ jobs:
           MINIO_USER:    ${{ inputs.minio_user }}
           MINIO_PASSWORD: ${{ inputs.minio_password }}
         run: |
-          if [[ ! "$ENV_NAME" =~ ^[a-z0-9_-]+$ ]]; then
-            echo "Invalid env name '$ENV_NAME'. Use lowercase letters, numbers, hyphens, underscores only."
+          if [[ ! "$ENV_NAME" =~ ^[a-z0-9_-][a-z0-9._-]*$ ]]; then
+            echo "Invalid env name '$ENV_NAME'. Use lowercase letters, numbers, dots, hyphens, underscores only, not starting with a dot."
             exit 1
           fi
 
@@ -78,7 +78,15 @@ jobs:
           MINIO_PASSWORD: ${{ inputs.minio_password }}
         run: |
           ENV="$ENV_NAME"
-          ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          # Same secret-name mapping as update-reports.yml: uppercase, anything outside A-Z0-9 becomes "_"
+          ENV_UPPER=$(printf '%s' "$ENV" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+
+          CLASH=$(echo "$CURRENT" | jq -r --arg env "$ENV" --arg key "$ENV_UPPER" \
+            'map(select(type == "string" and . != $env and (ascii_upcase | gsub("[^A-Z0-9]"; "_")) == $key)) | join(", ")')
+          if [ -n "$CLASH" ]; then
+            echo "::error::'$ENV' would share the MINIO_${ENV_UPPER}_* secrets with $CLASH. Pick a different name."
+            exit 1
+          fi
 
           EXISTS=$(echo "$CURRENT" | jq --arg env "$ENV" 'map(select(. == $env)) | length')
 
@@ -141,7 +149,7 @@ jobs:
           CURRENT:   ${{ steps.read_envs.outputs.current }}
         run: |
           ENV="$ENV_NAME"
-          ENV_UPPER=$(echo "$ENV" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          ENV_UPPER=$(printf '%s' "$ENV" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
 
           EXISTS=$(echo "$CURRENT" | jq --arg env "$ENV" 'map(select(. == $env)) | length')
           if [ "$EXISTS" -eq 0 ]; then
