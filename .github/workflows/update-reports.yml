@@ -10,6 +10,10 @@ on:
         description: 'JSON array of envs, e.g. ["released","qa11new"]; empty = vars.MINIO_ENVS'
         required: false
         type: string
+      partial_envs:
+        description: 'TEST HARNESS: JSON array of envs whose DSL listings are made to fail, to show a partial scan'
+        required: false
+        type: string
 
 # One run at a time. Envs on the same WireGuard slot are queued by the per-env
 # concurrency group, and GitHub keeps only one pending job per group, so two
@@ -228,6 +232,25 @@ jobs:
           chmod +x mc
           sudo mv mc /usr/local/bin/
           mc --version
+
+      # TEST HARNESS (fork only): every dslreports listing fails like a dropped
+      # tunnel, so the env reports partial while the rest of it is scanned.
+      - name: "TEST HARNESS: break DSL listings"
+        if: contains(fromJson(inputs.partial_envs || '[]'), matrix.env)
+        run: |
+          sudo mv /usr/local/bin/mc /usr/local/bin/mc.real
+          sudo tee /usr/local/bin/mc > /dev/null <<'EOF'
+          #!/usr/bin/env bash
+          for ARG in "$@"; do
+            case "$ARG" in
+              */dslreports/*)
+                echo '{"status":"error","error":{"message":"Unable to list folder.","cause":{"message":"dial tcp: i/o timeout (simulated by the test harness)","error":{}}}}'
+                exit 1 ;;
+            esac
+          done
+          exec /usr/local/bin/mc.real "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/mc
 
       - name: Configure MinIO Alias
         id: configure_minio
@@ -490,8 +513,6 @@ jobs:
           {
             echo "## MinIO Environment Summary"
             echo ""
-            echo "An env is **failed** only when nothing could be fetched. **partial** means MinIO answered but some listings failed, or it held no recent reports."
-            echo ""
             echo "| Env | Result | Detail |"
             echo "|---|---|---|"
             printf '%s' "$ROWS"
@@ -600,7 +621,7 @@ jobs:
               blocks: ([
                 {
                   type: "header",
-                  text: { type: "plain_text", text: ("MinIO Report — " + $date), emoji: true }
+                  text: { type: "plain_text", text: ("[TEST, fork] MinIO Report — " + $date), emoji: true }
                 },
                 {
                   type: "section",
