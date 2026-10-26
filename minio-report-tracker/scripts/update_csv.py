@@ -32,7 +32,10 @@ else:
 MINIO_BUCKETS = ["apitestrig", "automation", "dslreports", "uitestrig"]
 columns = ["Date", "Module", "T", "P", "S", "F", "I", "KI"]
 
+# An env is "failed" only when nothing could be fetched at all. "partial" means
+# MinIO answered but some listings still failed, or it held no recent reports.
 failed_aliases     = []
+partial_aliases    = []
 successful_aliases = []
 failure_reasons    = {}
 
@@ -54,9 +57,9 @@ def date_key_from_minio_ts(ts: str) -> str:
     return format_date_str(dt.astimezone(IST))
 
 
-# A listing that times out or errors is retried, then fails the env loudly.
-# Returning an empty list instead would write a thin sheet that looks like
-# "no reports today".
+# A listing that times out or errors is retried. If it still fails it is
+# recorded, so the env is reported as partial (some listings failed) or failed
+# (none worked) instead of passing off a thin sheet as "no reports today".
 MC_TIMEOUT  = int(os.getenv("MC_TIMEOUT", "120"))
 MC_ATTEMPTS = int(os.getenv("MC_ATTEMPTS", "3"))
 
@@ -74,6 +77,10 @@ def mc_error_text(entry):
     text  = (error.get("cause") or {}).get("message") or error.get("message") or "unknown error"
     code  = mc_error_code(entry)
     return f"{text} ({code})" if code else text
+
+
+# Per-env tally of listings, reset at the start of each env's scan.
+listings = {"ok": 0, "failed": []}
 
 
 def run_mc_json_lines(alias, command):
@@ -98,6 +105,7 @@ def run_mc_json_lines(alias, command):
 
             failed = [e for e in errors if mc_error_code(e) not in MC_EMPTY_CODES]
             if not failed:
+                listings["ok"] += 1
                 return entries
             problem = mc_error_text(failed[0])
 
@@ -105,7 +113,9 @@ def run_mc_json_lines(alias, command):
         if attempt < MC_ATTEMPTS:
             time.sleep(5 * attempt)
 
-    raise RuntimeError(f"mc failed after {MC_ATTEMPTS} attempts, {problem}: {command}")
+    log(alias, f"Giving up on listing after {MC_ATTEMPTS} attempts: {command}")
+    listings["failed"].append(f"{command.split()[-1]} ({problem})")
+    return []
 
 
 def append_row(all_data_by_date, date_key, module, row):
@@ -116,6 +126,7 @@ def append_row(all_data_by_date, date_key, module, row):
 
 for alias in MINIO_ALIASES:
     mc_alias = mc_alias_override or alias
+    listings["ok"], listings["failed"] = 0, []
     try:
         log(alias, "Starting MinIO scan")
         csv_filename   = f"{alias}.csv"
@@ -256,15 +267,26 @@ for alias in MINIO_ALIASES:
         log(alias, f"Available date buckets (IST): {sorted_dates[:10]}")
         log(alias, f"Selected latest 5 working days: {weekdays_only}")
 
+        log(alias, f"Listings: {listings['ok']} ok, {len(listings['failed'])} failed")
+
         dfs = [pd.DataFrame(all_data_by_date[d], columns=columns) for d in weekdays_only]
 
-        if not dfs:
-            reason = "No usable report data found after parsing MinIO objects and applying the latest 5 working days filter."
+        if listings["ok"] == 0:
+            reason = f"Could not reach MinIO: every listing failed. First error: {listings['failed'][0]}"
             log(alias, reason)
-            failure_reasons[alias] = {"reason": reason,
+            failure_reasons[alias] = {"state": "failed", "reason": reason,
+                                      "failed_listings": listings["failed"]}
+            failed_aliases.append(alias)
+            continue
+
+        if not dfs:
+            reason = "MinIO answered, but holds no reports from the latest 5 working days."
+            log(alias, reason)
+            failure_reasons[alias] = {"state": "partial", "reason": reason,
+                                      "failed_listings": listings["failed"],
                                       "available_dates": sorted_dates[:10],
                                       "bucket_stats": bucket_stats}
-            failed_aliases.append(alias)
+            partial_aliases.append(alias)
             continue
 
         max_len = max(len(df) for df in dfs)
@@ -276,13 +298,23 @@ for alias in MINIO_ALIASES:
 
         os.makedirs("../csv", exist_ok=True)
         pd.concat(dfs, axis=1).to_csv(f"../csv/{csv_filename}", index=False)
-        successful_aliases.append(alias)
         log(alias, f"CSV written to ../csv/{csv_filename}")
+
+        if listings["failed"]:
+            reason = (f"{len(listings['failed'])} listing(s) failed after {MC_ATTEMPTS} attempts; "
+                      f"modules under them may be missing: {', '.join(listings['failed'])}")
+            log(alias, reason)
+            failure_reasons[alias] = {"state": "partial", "reason": reason,
+                                      "failed_listings": listings["failed"]}
+            partial_aliases.append(alias)
+        else:
+            failure_reasons[alias] = {"state": "success", "reason": ""}
+            successful_aliases.append(alias)
 
     except Exception as exc:
         log(alias, f"Failed with exception: {exc}")
         failed_aliases.append(alias)
-        failure_reasons[alias] = {"reason": str(exc)}
+        failure_reasons[alias] = {"state": "failed", "reason": str(exc)}
         continue
 
 
@@ -291,5 +323,6 @@ os.makedirs("../status", exist_ok=True)
 alias_name = env_name if env_name else "all"
 with open(f"../status/status_{alias_name}.json", "w", encoding="utf-8") as handle:
     json.dump({"success": successful_aliases,
+               "partial": partial_aliases,
                "failed":  failed_aliases,
                "details": failure_reasons}, handle, indent=2)
