@@ -81,6 +81,26 @@ _gspread_request = _gspread_owner.request
 _gspread_owner.request = lambda self, *a, **kw: with_quota_retry(lambda: _gspread_request(self, *a, **kw))
 
 
+def find_date_col(headers, date_label):
+    """
+    Column of the block for date_label, or -1. The date is written as
+    "02-November-2026" but Sheets stores it as a date and shows
+    "2-November-2026", so compare dates, not text. Matching as text missed
+    every block on days 1-9, and each run added a duplicate block.
+    """
+    def as_date(value):
+        try:
+            return datetime.strptime(str(value).strip(), "%d-%B-%Y").date()
+        except ValueError:
+            return None
+
+    wanted = as_date(date_label)
+    for idx, header in enumerate(headers):
+        if wanted and as_date(header) == wanted:
+            return idx
+    return -1
+
+
 def col_to_a1(col_idx):
     a1 = ""
     col_idx += 1
@@ -242,8 +262,8 @@ def add_failure_note(service, spreadsheet, sheet_name, reason):
     sheet_headers = existing_data[0] if existing_data else []
 
     # An earlier run already wrote today's block; its data stands, so do not
-    # mark it FAILED. Sheets shows the day without a leading zero.
-    if today in sheet_headers or today.lstrip("0") in sheet_headers:
+    # mark it FAILED.
+    if find_date_col(sheet_headers, today) != -1:
         print(f"  '{today}' already has a block on '{sheet_name}' from an earlier run; leaving it as is.")
         return
 
@@ -362,7 +382,7 @@ def update_sheet(service, spreadsheet, sheet_name, csv_path):
     aligned_data_block = [csv_data_map.get(m, [None] * NUM_DATA_COLS) for m in master_module_list]
 
     sheet_headers = existing_data[0] if existing_data else []
-    target_col    = sheet_headers.index(date_label) if date_label in sheet_headers else -1
+    target_col    = find_date_col(sheet_headers, date_label)
 
     if target_col == -1:
         print(f"  Date '{date_label}' not found. Beginning column insertion process.")
