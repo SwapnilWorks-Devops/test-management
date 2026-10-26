@@ -194,14 +194,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # pip keeps the packages it downloads in ~/.cache/pip. Restoring that folder
-      # from the last run lets pip install from disk instead of downloading again.
-      - name: Restore pip download cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py3.11-pandas-gspread-oauth2client-google-api-python-client-google-auth
-
       # Only what update_csv.py and update_sheet.py import; the XLSX libraries
       # (matplotlib, openpyxl) are needed by Summary alone.
       - name: Install Python dependencies
@@ -456,12 +448,6 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
-      - name: Restore pip download cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-py3.11-summary-pandas-matplotlib-openpyxl-gspread-oauth2client-gspread-formatting-google-api-python-client-google-auth
 
       - name: Install Python dependencies
         run: |
