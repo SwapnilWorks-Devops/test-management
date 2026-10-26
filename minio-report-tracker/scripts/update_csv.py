@@ -115,6 +115,10 @@ def run_mc_json_lines(alias, command):
 
     log(alias, f"Giving up on listing after {MC_ATTEMPTS} attempts: {command}")
     listings["failed"].append(f"{command.split()[-1]} ({problem})")
+    if listings["ok"] == 0:
+        # Nothing has worked yet, so MinIO is unreachable. Stop now rather than
+        # wait out every remaining listing's timeouts.
+        raise RuntimeError(f"Could not reach MinIO: {listings['failed'][0]}")
     return []
 
 
