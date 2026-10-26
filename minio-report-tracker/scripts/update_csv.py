@@ -116,9 +116,9 @@ def run_mc_json_lines(alias, command):
     log(alias, f"Giving up on listing after {MC_ATTEMPTS} attempts: {command}")
     listings["failed"].append(f"{command.split()[-1]} ({problem})")
     if listings["ok"] == 0:
-        # Nothing has worked yet, so MinIO is unreachable. Stop now rather than
+        # Nothing has worked yet, so MinIO cannot be read. Stop now rather than
         # wait out every remaining listing's timeouts.
-        raise RuntimeError(f"Could not reach MinIO: {listings['failed'][0]}")
+        raise RuntimeError(f"Could not read from MinIO: {listings['failed'][0]}")
     return []
 
 
@@ -276,7 +276,7 @@ for alias in MINIO_ALIASES:
         dfs = [pd.DataFrame(all_data_by_date[d], columns=columns) for d in weekdays_only]
 
         if listings["ok"] == 0:
-            reason = f"Could not reach MinIO: every listing failed. First error: {listings['failed'][0]}"
+            reason = f"Could not read from MinIO: every listing failed. First error: {listings['failed'][0]}"
             log(alias, reason)
             failure_reasons[alias] = {"state": "failed", "reason": reason,
                                       "failed_listings": listings["failed"]}
