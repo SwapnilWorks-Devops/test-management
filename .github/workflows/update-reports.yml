@@ -20,23 +20,74 @@ concurrency:
 
 jobs:
 
-  # A WireGuard peer is one key pair, and the server keeps a single endpoint per
-  # peer, so jobs sharing a key take the tunnel from each other and get empty or
-  # partial listings. Spread the envs round-robin over the WIREGUARD_CONF slots
-  # that are set: WIREGUARD_CONF, then WIREGUARD_CONF_1 .. WIREGUARD_CONF_4.
+  # Validates MINIO_ENVS and derives, per env, the secret-name key and an mc alias.
+  # Secret names only allow [A-Z0-9_] and mc aliases must match ^[A-Za-z][A-Za-z0-9_-]*$,
+  # so an env such as 131ga or qa-1.3 cannot be used as-is for either.
+  #
+  # Then gives every env its own WireGuard peer. A peer is one key pair, and the
+  # server keeps a single endpoint per peer, so jobs sharing a key take the tunnel
+  # from each other and get empty or partial listings. Envs are spread round-robin
+  # over the WIREGUARD_CONF slots that are set: WIREGUARD_CONF, then _1 .. _4.
   plan:
-    name: Assign WireGuard slots
+    name: Plan environments
     runs-on: ubuntu-latest
     environment:
       name: daily-automation-reports
     outputs:
-      matrix: ${{ steps.assign.outputs.matrix }}
+      matrix:  ${{ steps.assign.outputs.matrix }}
+      count:   ${{ steps.resolve.outputs.count }}
+      invalid: ${{ steps.resolve.outputs.invalid }}
 
     steps:
+      - name: Resolve MINIO_ENVS
+        id: resolve
+        env:
+          MINIO_ENVS: ${{ inputs.envs || vars.MINIO_ENVS }}
+        run: |
+          if ! jq -e 'type == "array"' <<< "$MINIO_ENVS" > /dev/null 2>&1; then
+            echo "::error::MINIO_ENVS must be a JSON array of env names, got: $MINIO_ENVS"
+            exit 1
+          fi
+
+          # name:  letters, digits, dots, hyphens, underscores; no leading dot (upload-artifact skips hidden files)
+          # key:   uppercased, anything outside A-Z0-9 becomes "_"  ->  MINIO_<key>_URL / _USER / _PASSWORD
+          # alias: the name itself when mc accepts it, otherwise env_<name> with dots turned into "_"
+          RESOLVED=$(jq -c '
+            reduce .[] as $name ({include: [], invalid: [], seen: {}};
+              if ($name | type) != "string" or ($name | test("^[A-Za-z0-9_-][A-Za-z0-9._-]*$") | not) then
+                .invalid += [{env: ($name | tostring),
+                              reason: "invalid name, use letters, digits, dots, hyphens and underscores, not starting with a dot"}]
+              else
+                ($name | ascii_upcase | gsub("[^A-Z0-9]"; "_")) as $key
+                | if .seen[$key] == null then
+                    .seen[$key] = $name
+                    | .include += [{
+                        env:   $name,
+                        key:   $key,
+                        alias: (if ($name | test("^[A-Za-z][A-Za-z0-9_-]*$")) then $name
+                                else "env_" + ($name | gsub("[^A-Za-z0-9_-]"; "_")) end)
+                      }]
+                  elif .seen[$key] == $name then .
+                  else
+                    .invalid += [{env: $name,
+                                  reason: "shares the MINIO_\($key)_* secrets with \(.seen[$key]), rename one of them"}]
+                  end
+              end)
+            | {include, invalid}' <<< "$MINIO_ENVS")
+
+          jq -r '.include[] | "\(.env): secrets MINIO_\(.key)_*, mc alias \(.alias)"' <<< "$RESOLVED"
+          jq -r '.invalid[] | "::error::MINIO_ENVS entry \(.env | @json) skipped: \(.reason)"' <<< "$RESOLVED"
+
+          {
+            echo "include=$(jq -c '.include' <<< "$RESOLVED")"
+            echo "count=$(jq '.include | length' <<< "$RESOLVED")"
+            echo "invalid=$(jq -c '.invalid' <<< "$RESOLVED")"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Assign envs to WireGuard slots
         id: assign
         env:
-          MINIO_ENVS: ${{ inputs.envs || vars.MINIO_ENVS }}
+          ENVS: ${{ steps.resolve.outputs.include }}
           WIREGUARD_CONF:   ${{ secrets.WIREGUARD_CONF }}
           WIREGUARD_CONF_1: ${{ secrets.WIREGUARD_CONF_1 }}
           WIREGUARD_CONF_2: ${{ secrets.WIREGUARD_CONF_2 }}
@@ -76,8 +127,8 @@ jobs:
 
           # `group` is the concurrency group: envs on the same slot queue behind each other.
           MATRIX=$(jq -c '[to_entries[] | $ARGS.positional[.key % ($ARGS.positional | length)] as $wg
-                           | {env: .value, wg: $wg, group: $wg}]' \
-                     --args "${SLOTS[@]}" <<< "$MINIO_ENVS")
+                           | .value + {wg: $wg, group: $wg}]' \
+                     --args "${SLOTS[@]}" <<< "$ENVS")
 
           # A slot runs one env and queues one more. A third would make GitHub
           # cancel the queued one, so with too few slots fall back to running
@@ -97,6 +148,7 @@ jobs:
   per-env:
     name: "env: ${{ matrix.env }}"
     needs: plan
+    if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     # A healthy scan takes about two minutes. The cap stops a stuck scan from
     # holding its WireGuard slot, and the env queued behind it, for hours.
@@ -115,9 +167,9 @@ jobs:
       cancel-in-progress: false
 
     env:
-      MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.env)] }}
-      MINIO_USER:     ${{ secrets[format('MINIO_{0}_USER',     matrix.env)] }}
-      MINIO_PASSWORD: ${{ secrets[format('MINIO_{0}_PASSWORD', matrix.env)] }}
+      MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.key)] }}
+      MINIO_USER:     ${{ secrets[format('MINIO_{0}_USER',     matrix.key)] }}
+      MINIO_PASSWORD: ${{ secrets[format('MINIO_{0}_PASSWORD', matrix.key)] }}
 
     steps:
       - name: Checkout repo
@@ -180,11 +232,11 @@ jobs:
       - name: Configure MinIO Alias
         id: configure_minio
         run: |
-          ALIAS="${{ matrix.env }}"
-          echo "Configuring mc alias '$ALIAS' -> $MINIO_URL"
+          ALIAS="${{ matrix.alias }}"
+          echo "Configuring mc alias '$ALIAS' for env '${{ matrix.env }}' -> $MINIO_URL"
 
           if [ -z "$MINIO_URL" ] || [ -z "$MINIO_USER" ] || [ -z "$MINIO_PASSWORD" ]; then
-            REASON="One or more MinIO secrets are empty for env '$ALIAS'. Expected: MINIO_${ALIAS^^}_URL / _USER / _PASSWORD"
+            REASON="One or more MinIO secrets are empty for env '${{ matrix.env }}'. Expected: MINIO_${{ matrix.key }}_URL / _USER / _PASSWORD"
             echo "$REASON"
             echo "$REASON" > /tmp/step_failure_reason.txt
             exit 1
@@ -196,7 +248,7 @@ jobs:
       - name: Debug MinIO raw listings
         if: github.event_name == 'workflow_dispatch'
         run: |
-          ALIAS="${{ matrix.env }}"
+          ALIAS="${{ matrix.alias }}"
           echo "== $ALIAS/dslreports/full =="
           timeout 15s mc ls --json "$ALIAS/dslreports/full/" || true
           echo ""
@@ -213,6 +265,7 @@ jobs:
         id: run_csv_generation
         run: |
           export MINIO_ENV="${{ matrix.env }}"
+          export MINIO_MC_ALIAS="${{ matrix.alias }}"
           python minio-report-tracker/scripts/update_csv.py
 
       - name: Debug generated outputs
@@ -248,36 +301,56 @@ jobs:
             echo "No status file found at $STATUS_SRC."
           fi
 
+      # success: every listing read. partial: MinIO answered but some listings
+      # failed or it held no recent reports. failed: nothing could be fetched,
+      # including a job that stopped before update_csv.py reported.
       - name: Normalize per-env status
         if: always()
+        env:
+          ENV_NAME: ${{ matrix.env }}
         run: |
-          CSV_FILE="minio-report-tracker/csv/${{ matrix.env }}.csv"
-          STATUS_FILE="minio-report-tracker/status/status_${{ matrix.env }}.json"
-          ORIG_STATUS="../status/status_${{ matrix.env }}.json"
+          CSV_FILE="minio-report-tracker/csv/$ENV_NAME.csv"
+          STATUS_FILE="minio-report-tracker/status/status_$ENV_NAME.json"
+          ORIG_STATUS="../status/status_$ENV_NAME.json"
           mkdir -p minio-report-tracker/status
 
-          REASON=""
+          STATE=""; REASON=""; LISTINGS="[]"
           if [ -f "$ORIG_STATUS" ]; then
-            REASON=$(jq -r --arg env "${{ matrix.env }}" '.details[$env].reason // ""' "$ORIG_STATUS" 2>/dev/null || echo "")
+            STATE=$(jq -r --arg env "$ENV_NAME" '.details[$env].state // ""' "$ORIG_STATUS")
+            REASON=$(jq -r --arg env "$ENV_NAME" '.details[$env].reason // ""' "$ORIG_STATUS")
+            LISTINGS=$(jq -c --arg env "$ENV_NAME" '.details[$env].failed_listings // []' "$ORIG_STATUS")
           fi
-          if [ -z "$REASON" ] && [ -f "/tmp/step_failure_reason.txt" ]; then
-            REASON=$(cat /tmp/step_failure_reason.txt)
+          if [ -z "$STATE" ]; then
+            STATE=failed
+            REASON=$(cat /tmp/step_failure_reason.txt 2>/dev/null || true)
+            REASON=${REASON:-"The scan did not finish; see this job's log."}
+          elif [ "$STATE" = success ] && [ ! -f "$CSV_FILE" ]; then
+            STATE=failed
+            REASON="The scan finished but no CSV was collected."
           fi
 
-          if [ -f "$CSV_FILE" ]; then
-            if [ -f "$STATUS_FILE" ]; then
-              jq --arg env "${{ matrix.env }}" '.success = [$env] | .failed = []' "$STATUS_FILE" > /tmp/norm_tmp.json && mv /tmp/norm_tmp.json "$STATUS_FILE"
-            else
-              jq -n --arg env "${{ matrix.env }}" '{"success":[$env],"failed":[],"reason":""}' > "$STATUS_FILE"
-            fi
-          else
-            if [ -f "$STATUS_FILE" ]; then
-              jq --arg env "${{ matrix.env }}" --arg reason "$REASON" '.success = [] | .failed = [$env] | .reason = $reason' "$STATUS_FILE" > /tmp/norm_tmp.json && mv /tmp/norm_tmp.json "$STATUS_FILE"
-            else
-              jq -n --arg env "${{ matrix.env }}" --arg reason "$REASON" '{"success":[],"failed":[$env],"reason":$reason}' > "$STATUS_FILE"
-            fi
-          fi
+          jq -n --arg env "$ENV_NAME" --arg state "$STATE" --arg reason "$REASON" --argjson listings "$LISTINGS" '{
+            state: $state, reason: $reason, failed_listings: $listings,
+            success: (if $state == "success" then [$env] else [] end),
+            partial: (if $state == "partial" then [$env] else [] end),
+            failed:  (if $state == "failed"  then [$env] else [] end)
+          }' > "$STATUS_FILE"
           echo "Status written: $(cat "$STATUS_FILE")"
+
+      # Write this env's tab now rather than waiting for every env to finish.
+      # If it cannot (e.g. Google's quota stays exhausted), Summary writes it.
+      - name: Update Google Sheet
+        if: always()
+        env:
+          ENV_NAME: ${{ matrix.env }}
+          GSHEETCREDS: ${{ secrets.GSHEETCREDS }}
+        run: |
+          printf '%s' "$GSHEETCREDS" > creds.json
+          SHEET_CSV_DIR=minio-report-tracker/csv \
+          SHEET_STATUS_DIR=minio-report-tracker/status \
+          SHEET_REPORT="minio-report-tracker/status/sheet_$ENV_NAME.json" \
+            python minio-report-tracker/scripts/update_sheet.py
+
       - name: Debug collected files
         if: github.event_name == 'workflow_dispatch'
         run: |
@@ -300,13 +373,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: status-${{ matrix.env }}
-          path: minio-report-tracker/status/status_${{ matrix.env }}.json
+          path: |
+            minio-report-tracker/status/status_${{ matrix.env }}.json
+            minio-report-tracker/status/sheet_${{ matrix.env }}.json
           if-no-files-found: error
 
-  # Waits for all per-env jobs, merges CSVs, generates XLSX, updates Google Sheet, and notifies Slack on failure
+  # Waits for all per-env jobs, generates the XLSX, writes any tab an env job could
+  # not, reports the Google Sheets quota, and notifies Slack about partial or failed envs
   summary:
     name: Summary
-    needs: per-env
+    needs: [plan, per-env]
     runs-on: ubuntu-latest
     if: always()
     environment:
@@ -348,8 +424,9 @@ jobs:
 
       - name: Collect status files from artifacts
         run: |
-          mkdir -p status
-          find artifacts -name "*.json" -exec cp {} status/ \;
+          mkdir -p status sheet-reports
+          find artifacts -name "status_*.json" -exec cp {} status/ \;
+          find artifacts -name "sheet_*.json" -exec cp {} sheet-reports/ \;
 
       - name: Debug aggregate inputs
         if: github.event_name == 'workflow_dispatch'
@@ -363,77 +440,164 @@ jobs:
           echo "=== Collected status files ==="
           ls -la status || true
 
+      # Every planned env is classified, so an env whose job never reported
+      # (cancelled, timed out) is counted as failed rather than left out.
       - name: Generate workflow summary
+        env:
+          PLAN_RESULT:  ${{ needs.plan.result }}
+          PLANNED:      ${{ needs.plan.outputs.matrix }}
+          INVALID_ENVS: ${{ needs.plan.outputs.invalid }}
         run: |
-          echo "## MinIO Environment Summary" >> $GITHUB_STEP_SUMMARY
+          SUCCESS=""; PARTIAL=""; FAILED=""; NEEDS_SHEET=""
+          ROWS=""
 
-          FAILED=""
-          SUCCESS=""
+          for ENV_NAME in $(jq -r '.[].env' <<< "${PLANNED:-[]}"); do
+            STATUS="status/status_$ENV_NAME.json"
+            if [ -f "$STATUS" ]; then
+              STATE=$(jq -r '.state // "failed"' "$STATUS")
+              REASON=$(jq -r '.reason // ""' "$STATUS")
+            else
+              STATE=failed
+              REASON="The env job stopped before it reported (cancelled or timed out)."
+              jq -n --arg env "$ENV_NAME" --arg reason "$REASON" \
+                '{state: "failed", reason: $reason, success: [], partial: [], failed: [$env]}' > "$STATUS"
+            fi
+            case "$STATE" in
+              success) SUCCESS="$SUCCESS $ENV_NAME"; ICON=":white_check_mark:" ;;
+              partial) PARTIAL="$PARTIAL $ENV_NAME"; ICON=":warning:" ;;
+              *)       FAILED="$FAILED $ENV_NAME";   ICON=":x:" ;;
+            esac
+            ROWS="$ROWS| \`$ENV_NAME\` | $ICON $STATE | ${REASON//|/\\|} |"$'\n'
 
-          shopt -s nullglob
-          status_files=(status/*.json)
-          shopt -u nullglob
+            # Summary writes the tab when the env job did not, or not completely.
+            REPORT="sheet-reports/sheet_$ENV_NAME.json"
+            if [ ! -f "$REPORT" ] || [ "$(jq '.not_written | length' "$REPORT")" -gt 0 ]; then
+              NEEDS_SHEET="$NEEDS_SHEET $ENV_NAME"
+            fi
+          done
 
-          if [ ${#status_files[@]} -eq 0 ]; then
-            echo "No status files found — all environments may have failed to upload." >> $GITHUB_STEP_SUMMARY
-            echo "FAILED_ENVS=" >> $GITHUB_ENV
-            echo "SUCCESS_ENVS=" >> $GITHUB_ENV
-          else
-            for file in "${status_files[@]}"; do
-              ENV_NAME=$(basename "$file" | sed 's/status_//' | sed 's/.json//')
-              if python -c "import json,sys; data=json.load(open(sys.argv[1])); raise SystemExit(0 if sys.argv[2] in data.get('success',[]) else 1)" "$file" "$ENV_NAME"
-              then
-                echo "OK $ENV_NAME" >> $GITHUB_STEP_SUMMARY
-                SUCCESS="$SUCCESS $ENV_NAME"
-              else
-                echo "FAILED $ENV_NAME" >> $GITHUB_STEP_SUMMARY
-                FAILED="$FAILED $ENV_NAME"
-              fi
-            done
+          # MINIO_ENVS entries that never got a job
+          if [ "$PLAN_RESULT" != "success" ]; then
+            FAILED="$FAILED MINIO_ENVS"
+            ROWS="$ROWS| MINIO_ENVS | :x: failed | not a JSON array of env names, or no WireGuard config |"$'\n'
           fi
+          while IFS=$'\t' read -r INVALID_NAME INVALID_REASON; do
+            [ -n "$INVALID_NAME" ] || continue
+            FAILED="$FAILED $INVALID_NAME"
+            ROWS="$ROWS| \`$INVALID_NAME\` | :x: failed | $INVALID_REASON |"$'\n'
+          done < <(jq -r '.[] | [(.env | gsub("\\s"; "_")), .reason] | @tsv' <<< "${INVALID_ENVS:-[]}")
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Failed Environments" >> $GITHUB_STEP_SUMMARY
-          echo "${FAILED:-'(none)'}" >> $GITHUB_STEP_SUMMARY
-          echo "### Successful Environments" >> $GITHUB_STEP_SUMMARY
-          echo "${SUCCESS:-'(none)'}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## MinIO Environment Summary"
+            echo ""
+            echo "An env is **failed** only when nothing could be fetched. **partial** means MinIO answered but some listings failed, or it held no recent reports."
+            echo ""
+            echo "| Env | Result | Detail |"
+            echo "|---|---|---|"
+            printf '%s' "$ROWS"
+          } >> $GITHUB_STEP_SUMMARY
 
-          echo "FAILED_ENVS=${FAILED# }" >> $GITHUB_ENV
           echo "SUCCESS_ENVS=${SUCCESS# }" >> $GITHUB_ENV
+          echo "PARTIAL_ENVS=${PARTIAL# }" >> $GITHUB_ENV
+          echo "FAILED_ENVS=${FAILED# }" >> $GITHUB_ENV
+          echo "NEEDS_SHEET_ENVS=${NEEDS_SHEET# }" >> $GITHUB_ENV
 
       - name: Generate XLSX
-        if: ${{ env.SUCCESS_ENVS != '' }}
+        if: ${{ env.SUCCESS_ENVS != '' || env.PARTIAL_ENVS != '' }}
         run: python minio-report-tracker/scripts/generate_xlsx.py
 
-      - name: Update Google Sheet
+      - name: Update Google Sheet for envs their own job could not write
+        if: ${{ env.NEEDS_SHEET_ENVS != '' }}
+        env:
+          GSHEETCREDS: ${{ secrets.GSHEETCREDS }}
+        run: |
+          printf '%s' "$GSHEETCREDS" > creds.json
+          mkdir -p fallback/csv fallback/status
+          for ENV_NAME in $NEEDS_SHEET_ENVS; do
+            cp "minio-report-tracker/csv/$ENV_NAME.csv" fallback/csv/ 2>/dev/null || true
+            cp "status/status_$ENV_NAME.json" fallback/status/
+          done
+          SHEET_CSV_DIR=fallback/csv SHEET_STATUS_DIR=fallback/status \
+          SHEET_REPORT=sheet-reports/summary.json \
+            python minio-report-tracker/scripts/update_sheet.py
+
+      # Every env writes through one Google service account, which allows about
+      # 60 writes a minute. Say whether that limit was hit and what it cost.
+      - name: Report Google Sheets quota
         if: always()
         run: |
-          echo '${{ secrets.GSHEETCREDS }}' > creds.json
-          python minio-report-tracker/scripts/update_sheet.py
+          shopt -s nullglob
+          REPORTS=(sheet-reports/*.json)
+          HITS=0; WAITED=0
+          for R in "${REPORTS[@]}"; do
+            HITS=$(( HITS + $(jq '.quota_hits // 0' "$R") ))
+            WAITED=$(( WAITED + $(jq '.quota_waited_s // 0' "$R") ))
+          done
 
-      - name: Notify Slack on failure
-        if: ${{ env.FAILED_ENVS != '' }}
+          # Tabs still unwritten: what the Summary write could not do, or every
+          # tab it was asked to write if it did not get as far as reporting.
+          UNWRITTEN=""
+          if [ -n "$NEEDS_SHEET_ENVS" ]; then
+            if [ -f sheet-reports/summary.json ]; then
+              UNWRITTEN=$(jq -r '.not_written | to_entries[] | "\(.key): \(.value)"' sheet-reports/summary.json)
+            else
+              UNWRITTEN=$(printf '%s: not written\n' $NEEDS_SHEET_ENVS)
+            fi
+          fi
+
+          {
+            echo ""
+            echo "### Google Sheets quota"
+            if [ "$HITS" -eq 0 ]; then
+              echo "Not hit."
+            else
+              echo ":warning: Google's write quota was hit **$HITS** time(s); the run waited **${WAITED}s** in total to retry."
+            fi
+            if [ -n "$UNWRITTEN" ]; then
+              echo ""
+              echo ":x: These tabs were **not written**. Rerun those envs or fill them by hand:"
+              echo '```'
+              echo "$UNWRITTEN"
+              echo '```'
+            elif [ "$HITS" -gt 0 ]; then
+              echo "Every tab was written after retrying."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+          echo "Quota hits: $HITS, waited ${WAITED}s"
+          # One line, no stray whitespace: an empty value must stay empty for the Slack condition.
+          echo "UNWRITTEN_TABS=$(echo $UNWRITTEN)" >> $GITHUB_ENV
+
+      - name: Notify Slack
+        if: ${{ always() && (env.FAILED_ENVS != '' || env.PARTIAL_ENVS != '' || env.UNWRITTEN_TABS != '') }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.TEST_AUTOMATION_SLACK_WEBHOOK }}
         run: |
           # TEST HARNESS: the fork has no webhook for this workflow.
           if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "No Slack webhook configured; skipping notification. FAILED_ENVS=$FAILED_ENVS"
+            echo "No Slack webhook configured; skipping notification. PARTIAL_ENVS=$PARTIAL_ENVS FAILED_ENVS=$FAILED_ENVS UNWRITTEN_TABS=$UNWRITTEN_TABS"
             exit 0
           fi
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE=$(date +'%d %b %Y')
 
-          FAILED_TEXT=$(echo "$FAILED_ENVS" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/:x: `/' | sed 's/$/`/')
-          SUCCESS_TEXT=$(echo "$SUCCESS_ENVS" | tr ' ' '\n' | sed '/^$/d' | sed 's/^/:white_check_mark: `/' | sed 's/$/`/')
+          list() { echo "$1" | tr ' ' '\n' | sed '/^$/d' | sed "s/^/$2 \`/" | sed 's/$/`/'; }
+          PASSED_TEXT=$(list "$SUCCESS_ENVS" ":white_check_mark:")
+          PARTIAL_TEXT=$(list "$PARTIAL_ENVS" ":warning:")
+          FAILED_TEXT=$(list "$FAILED_ENVS" ":x:")
+          NOTE=""
+          if [ -n "$UNWRITTEN_TABS" ]; then
+            NOTE="Google Sheet tabs not written: $UNWRITTEN_TABS"
+          fi
 
           PAYLOAD=$(jq -n \
             --arg date "$DATE" \
-            --arg failed "$FAILED_TEXT" \
-            --arg passed "$SUCCESS_TEXT" \
+            --arg passed "${PASSED_TEXT:-(none)}" \
+            --arg partial "${PARTIAL_TEXT:-(none)}" \
+            --arg failed "${FAILED_TEXT:-(none)}" \
+            --arg note "$NOTE" \
             --arg url "$RUN_URL" \
             '{
-              blocks: [
+              blocks: ([
                 {
                   type: "header",
                   text: { type: "plain_text", text: ("MinIO Report — " + $date), emoji: true }
@@ -442,9 +606,19 @@ jobs:
                   type: "section",
                   fields: [
                     { type: "mrkdwn", text: ("*:white_check_mark: Passed*\n" + $passed) },
+                    { type: "mrkdwn", text: ("*:warning: Partial*\n" + $partial) },
                     { type: "mrkdwn", text: ("*:x: Failed*\n" + $failed) }
                   ]
                 },
+                {
+                  type: "context",
+                  elements: [
+                    { type: "mrkdwn", text: "Failed: nothing could be fetched. Partial: MinIO answered, but some listings failed or it held no recent reports. Details are in the run summary." }
+                  ]
+                }
+              ]
+              + (if $note != "" then [{ type: "section", text: { type: "mrkdwn", text: (":x: " + $note) } }] else [] end)
+              + [
                 { type: "divider" },
                 {
                   type: "actions",
@@ -457,15 +631,15 @@ jobs:
                     }
                   ]
                 }
-              ]
+              ])
             }')
 
           curl -fsSL -X POST -H 'Content-type: application/json' \
                --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
-      - name: Fail if no environment succeeded
+      - name: Fail if no environment produced reports
         run: |
-          if [ -z "$SUCCESS_ENVS" ]; then
-            echo "No environments produced a CSV. Check the per-env logs above."
+          if [ -z "$SUCCESS_ENVS" ] && [ -z "$PARTIAL_ENVS" ]; then
+            echo "No environment could be read. Check the per-env logs above."
             exit 1
           fi
