@@ -156,6 +156,9 @@ jobs:
     # A healthy scan takes about two minutes. The cap stops a stuck scan from
     # holding its WireGuard slot, and the env queued behind it, for hours.
     timeout-minutes: 15
+    # A failed env shows as a failed job, but it is a result, not a broken
+    # workflow, so it does not fail the run. Summary reports it.
+    continue-on-error: true
     environment:
       name: daily-automation-reports
 
@@ -408,6 +411,21 @@ jobs:
             minio-report-tracker/status/status_${{ matrix.env }}.json
             minio-report-tracker/status/sheet_${{ matrix.env }}.json
           if-no-files-found: error
+
+      # Last, so the CSV, status and sheet write above have already happened.
+      - name: Report env result
+        if: always()
+        env:
+          STATUS_FILE: minio-report-tracker/status/status_${{ matrix.env }}.json
+        run: |
+          STATE=$(jq -r '.state // "failed"' "$STATUS_FILE" 2>/dev/null || echo failed)
+          REASON=$(jq -r '.reason // ""' "$STATUS_FILE" 2>/dev/null || true)
+          case "$STATE" in
+            success) echo "${{ matrix.env }}: success" ;;
+            partial) echo "::warning title=${{ matrix.env }} partial::$REASON" ;;
+            *)       echo "::error title=${{ matrix.env }} failed::${REASON:-no status was written}"
+                     exit 1 ;;
+          esac
 
   # Waits for all per-env jobs, generates the XLSX, writes any tab an env job could
   # not, reports the Google Sheets quota, and notifies Slack about partial or failed envs
