@@ -1,0 +1,25 @@
+# TEST ONLY (fork): two writes for the same day-1-9 date must leave one block.
+name: Test date block matching
+on:
+  push:
+    branches: [test-sheet-date]
+jobs:
+  date-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas gspread oauth2client google-api-python-client google-auth
+      - name: Two writes for 02-November-2026
+        env:
+          GSHEETCREDS: ${{ secrets.GSHEETCREDS }}
+        run: |
+          printf '%s' "$GSHEETCREDS" > creds.json
+          mkdir -p empty-status
+          for RUN in run1 run2; do
+            echo "=== $RUN"
+            SHEET_CSV_DIR=date-test/$RUN SHEET_STATUS_DIR=empty-status \
+              python minio-report-tracker/scripts/update_sheet.py
+          done
