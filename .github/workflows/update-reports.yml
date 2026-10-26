@@ -4,20 +4,115 @@ on:
   schedule:
     - cron: '50 3 * * 1-5'
   workflow_dispatch:
+    # TEST HARNESS (fork only): override MINIO_ENVS without editing the variable.
+    inputs:
+      envs:
+        description: 'JSON array of envs, e.g. ["released","qa11new"]; empty = vars.MINIO_ENVS'
+        required: false
+        type: string
+
+# One run at a time. Envs on the same WireGuard slot are queued by the per-env
+# concurrency group, and GitHub keeps only one pending job per group, so two
+# overlapping runs could cancel each other's queued envs.
+concurrency:
+  group: update-reports
+  cancel-in-progress: false
 
 jobs:
+
+  # A WireGuard peer is one key pair, and the server keeps a single endpoint per
+  # peer, so jobs sharing a key take the tunnel from each other and get empty or
+  # partial listings. Spread the envs round-robin over the WIREGUARD_CONF slots
+  # that are set: WIREGUARD_CONF, then WIREGUARD_CONF_1 .. WIREGUARD_CONF_4.
+  plan:
+    name: Assign WireGuard slots
+    runs-on: ubuntu-latest
+    environment:
+      name: daily-automation-reports
+    outputs:
+      matrix: ${{ steps.assign.outputs.matrix }}
+
+    steps:
+      - name: Assign envs to WireGuard slots
+        id: assign
+        env:
+          MINIO_ENVS: ${{ inputs.envs || vars.MINIO_ENVS }}
+          WIREGUARD_CONF:   ${{ secrets.WIREGUARD_CONF }}
+          WIREGUARD_CONF_1: ${{ secrets.WIREGUARD_CONF_1 }}
+          WIREGUARD_CONF_2: ${{ secrets.WIREGUARD_CONF_2 }}
+          WIREGUARD_CONF_3: ${{ secrets.WIREGUARD_CONF_3 }}
+          WIREGUARD_CONF_4: ${{ secrets.WIREGUARD_CONF_4 }}
+        run: |
+          SLOTS=()
+          declare -A KEY_OWNER ADDR_OWNER
+          for NAME in WIREGUARD_CONF WIREGUARD_CONF_1 WIREGUARD_CONF_2 WIREGUARD_CONF_3 WIREGUARD_CONF_4; do
+            CONF="${!NAME}"
+            [ -z "$CONF" ] && continue
+
+            # Two slots with the same key or tunnel address are one peer, and
+            # would roam exactly like a single shared config.
+            KEY=$(printf '%s\n' "$CONF" | sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' | sha256sum | cut -c1-16)
+            # A bare address means /32 to wg-quick, so compare it that way.
+            ADDR=$(printf '%s\n' "$CONF" | sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' \
+                     | tr -d '[:space:]' | sed -E 's#^([0-9.]+)$#\1/32#')
+            if [ -n "${KEY_OWNER[$KEY]:-}" ]; then
+              echo "::error::$NAME has the same PrivateKey as ${KEY_OWNER[$KEY]}. Every slot needs its own WireGuard peer."
+              exit 1
+            fi
+            if [ -n "${ADDR_OWNER[$ADDR]:-}" ]; then
+              echo "::error::$NAME has the same Address as ${ADDR_OWNER[$ADDR]}. Every slot needs its own tunnel address."
+              exit 1
+            fi
+            KEY_OWNER[$KEY]=$NAME
+            ADDR_OWNER[$ADDR]=$NAME
+            SLOTS+=("$NAME")
+          done
+
+          if [ ${#SLOTS[@]} -eq 0 ]; then
+            echo "::error::No WIREGUARD_CONF secret is set."
+            exit 1
+          fi
+          echo "WireGuard slots: ${SLOTS[*]}"
+
+          # `group` is the concurrency group: envs on the same slot queue behind each other.
+          MATRIX=$(jq -c '[to_entries[] | $ARGS.positional[.key % ($ARGS.positional | length)] as $wg
+                           | {env: .value, wg: $wg, group: $wg}]' \
+                     --args "${SLOTS[@]}" <<< "$MINIO_ENVS")
+
+          # A slot runs one env and queues one more. A third would make GitHub
+          # cancel the queued one, so with too few slots fall back to running
+          # every env at once on shared keys, the way it worked before slots.
+          ENV_COUNT=$(jq length <<< "$MATRIX")
+          PER_SLOT=$(jq '[group_by(.wg)[] | length] | max // 0' <<< "$MATRIX")
+          if [ "$PER_SLOT" -gt 2 ]; then
+            echo "::warning::$ENV_COUNT envs need at least $(( (ENV_COUNT + 1) / 2 )) WireGuard slots and only ${#SLOTS[@]} are set, so envs share keys and scans may come back partial. Add WIREGUARD_CONF_<n> secrets."
+            MATRIX=$(jq -c 'map(.group = "\(.wg)-\(.env)")' <<< "$MATRIX")
+          fi
+
+          echo "## WireGuard slots" >> $GITHUB_STEP_SUMMARY
+          jq -r '.[] | "- `\(.env)` -> `\(.wg)`"' <<< "$MATRIX" | tee -a $GITHUB_STEP_SUMMARY
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   # Runs once per env in MINIO_ENVS in parallel — connects to MinIO via WireGuard and generates a CSV
   per-env:
     name: "env: ${{ matrix.env }}"
+    needs: plan
     runs-on: ubuntu-latest
+    # A healthy scan takes about two minutes. The cap stops a stuck scan from
+    # holding its WireGuard slot, and the env queued behind it, for hours.
+    timeout-minutes: 15
     environment:
       name: daily-automation-reports
 
     strategy:
       fail-fast: false
       matrix:
-        env: ${{ fromJson(vars.MINIO_ENVS) }}
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    # Envs that share a WireGuard slot run one after the other, never together.
+    concurrency:
+      group: ${{ matrix.group }}
+      cancel-in-progress: false
 
     env:
       MINIO_URL:      ${{ secrets[format('MINIO_{0}_URL',      matrix.env)] }}
@@ -28,7 +123,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: daily-automation-reports
+          ref: test-wg-slots-scripts   # TEST HARNESS: scripts branch pointing at the test sheet
 
       - name: Reset per-env collected files
         run: |
@@ -50,10 +145,14 @@ jobs:
         run: sudo apt-get install -y wireguard
 
       - name: Configure WireGuard
+        env:
+          WG_CONF: ${{ secrets[matrix.wg] }}
         run: |
-          echo "${{ secrets.WIREGUARD_CONF }}" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          printf '%s\n' "$WG_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo chmod 600 /etc/wireguard/wg0.conf
           sudo wg-quick up wg0
+          # Public key and tunnel address are not secret; distinct slots must show distinct values.
+          echo "env '${{ matrix.env }}' on ${{ matrix.wg }}: public key $(sudo wg show wg0 public-key), address $(ip -4 -o addr show wg0 | awk '{print $4}')"
 
       - name: Verify WireGuard tunnel
         if: github.event_name == 'workflow_dispatch'
@@ -217,7 +316,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: daily-automation-reports
+          ref: test-wg-slots-scripts   # TEST HARNESS: scripts branch pointing at the test sheet
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -317,6 +416,11 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.TEST_AUTOMATION_SLACK_WEBHOOK }}
         run: |
+          # TEST HARNESS: the fork has no webhook for this workflow.
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "No Slack webhook configured; skipping notification. FAILED_ENVS=$FAILED_ENVS"
+            exit 0
+          fi
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE=$(date +'%d %b %Y')
 
