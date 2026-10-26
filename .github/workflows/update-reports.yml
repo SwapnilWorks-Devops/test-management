@@ -252,6 +252,9 @@ jobs:
           EOF
           sudo chmod +x /usr/local/bin/mc
 
+      # An env that cannot be reached is a result, not a broken workflow: record
+      # why, skip the scan, and let the env be reported as failed while the job
+      # (and the run) stays green.
       - name: Configure MinIO Alias
         id: configure_minio
         run: |
@@ -260,16 +263,20 @@ jobs:
 
           if [ -z "$MINIO_URL" ] || [ -z "$MINIO_USER" ] || [ -z "$MINIO_PASSWORD" ]; then
             REASON="One or more MinIO secrets are empty for env '${{ matrix.env }}'. Expected: MINIO_${{ matrix.key }}_URL / _USER / _PASSWORD"
-            echo "$REASON"
-            echo "$REASON" > /tmp/step_failure_reason.txt
-            exit 1
+          elif ! mc alias set "$ALIAS" "$MINIO_URL" "$MINIO_USER" "$MINIO_PASSWORD" --api S3v2; then
+            REASON="Could not configure the mc alias for env '${{ matrix.env }}'."
+          else
+            echo "Alias '$ALIAS' configured."
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          mc alias set "$ALIAS" "$MINIO_URL" "$MINIO_USER" "$MINIO_PASSWORD" --api S3v2
-          echo "Alias '$ALIAS' configured."
+          echo "::warning::$REASON"
+          echo "$REASON" > /tmp/step_failure_reason.txt
+          echo "ready=false" >> "$GITHUB_OUTPUT"
 
       - name: Debug MinIO raw listings
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.configure_minio.outputs.ready == 'true'
         run: |
           ALIAS="${{ matrix.alias }}"
           echo "== $ALIAS/dslreports/full =="
@@ -286,13 +293,14 @@ jobs:
 
       - name: Run CSV generation
         id: run_csv_generation
+        if: steps.configure_minio.outputs.ready == 'true'
         run: |
           export MINIO_ENV="${{ matrix.env }}"
           export MINIO_MC_ALIAS="${{ matrix.alias }}"
           python minio-report-tracker/scripts/update_csv.py
 
       - name: Debug generated outputs
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.configure_minio.outputs.ready == 'true'
         run: |
           echo "== ../csv =="
           ls -la ../csv || echo "(directory does not exist)"
@@ -364,6 +372,7 @@ jobs:
       # If it cannot (e.g. Google's quota stays exhausted), Summary writes it.
       - name: Update Google Sheet
         if: always()
+        continue-on-error: true
         env:
           ENV_NAME: ${{ matrix.env }}
           GSHEETCREDS: ${{ secrets.GSHEETCREDS }}
@@ -529,6 +538,7 @@ jobs:
 
       - name: Update Google Sheet for envs their own job could not write
         if: ${{ env.NEEDS_SHEET_ENVS != '' }}
+        continue-on-error: true
         env:
           GSHEETCREDS: ${{ secrets.GSHEETCREDS }}
         run: |
@@ -610,6 +620,7 @@ jobs:
             NOTE="Google Sheet tabs not written: $UNWRITTEN_TABS"
           fi
 
+          # Slack lays section fields out two per row: Passed | Failed, then Partial below.
           PAYLOAD=$(jq -n \
             --arg date "$DATE" \
             --arg passed "${PASSED_TEXT:-(none)}" \
@@ -625,17 +636,12 @@ jobs:
                 },
                 {
                   type: "section",
-                  fields: [
+                  fields: ([
                     { type: "mrkdwn", text: ("*:white_check_mark: Passed*\n" + $passed) },
-                    { type: "mrkdwn", text: ("*:warning: Partial*\n" + $partial) },
                     { type: "mrkdwn", text: ("*:x: Failed*\n" + $failed) }
-                  ]
-                },
-                {
-                  type: "context",
-                  elements: [
-                    { type: "mrkdwn", text: "Failed: nothing could be fetched. Partial: MinIO answered, but some listings failed or it held no recent reports. Details are in the run summary." }
-                  ]
+                  ] + (if $partial != "(none)" then [
+                    { type: "mrkdwn", text: ("*:warning: Partial*\n" + $partial) }
+                  ] else [] end))
                 }
               ]
               + (if $note != "" then [{ type: "section", text: { type: "mrkdwn", text: (":x: " + $note) } }] else [] end)
