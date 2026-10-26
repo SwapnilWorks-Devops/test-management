@@ -1,7 +1,9 @@
 import os
 import json
 import re
+import shlex
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -49,21 +51,58 @@ def date_key_from_minio_ts(ts: str) -> str:
     return format_date_str(dt.astimezone(IST))
 
 
-# Remove timeout parameter and exception handler
-def run_mc_json_lines(alias, command):
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True
-    )
-    output = result.stdout
+# A listing that times out or errors is retried, then fails the env loudly.
+# Returning an empty list instead would write a thin sheet that looks like
+# "no reports today".
+MC_TIMEOUT  = int(os.getenv("MC_TIMEOUT", "120"))
+MC_ATTEMPTS = int(os.getenv("MC_ATTEMPTS", "3"))
 
-    entries = []
-    for line in output.splitlines():
+# Real answers that mean "nothing here", not a failed listing.
+MC_EMPTY_CODES = {"NoSuchBucket", "NoSuchKey"}
+
+
+def mc_error_code(entry):
+    cause = (entry.get("error") or {}).get("cause") or {}
+    return (cause.get("error") or {}).get("Code", "")
+
+
+def mc_error_text(entry):
+    error = entry.get("error") or {}
+    text  = (error.get("cause") or {}).get("message") or error.get("message") or "unknown error"
+    code  = mc_error_code(entry)
+    return f"{text} ({code})" if code else text
+
+
+def run_mc_json_lines(alias, command):
+    for attempt in range(1, MC_ATTEMPTS + 1):
         try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            if line.strip():
-                log(alias, f"Skipping non-JSON mc output: {line[:200]}")
-    return entries
+            result = subprocess.run(
+                shlex.split(command), capture_output=True, text=True, timeout=MC_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            problem = f"timed out after {MC_TIMEOUT}s"
+        else:
+            entries, errors = [], []
+            for line in result.stdout.splitlines():
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    if line.strip():
+                        log(alias, f"Skipping non-JSON mc output: {line[:200]}")
+                    continue
+                # mc --json reports errors as JSON objects with status "error".
+                (errors if entry.get("status") == "error" else entries).append(entry)
+
+            failed = [e for e in errors if mc_error_code(e) not in MC_EMPTY_CODES]
+            if not failed:
+                return entries
+            problem = mc_error_text(failed[0])
+
+        log(alias, f"mc attempt {attempt}/{MC_ATTEMPTS} {problem}: {command}")
+        if attempt < MC_ATTEMPTS:
+            time.sleep(5 * attempt)
+
+    raise RuntimeError(f"mc failed after {MC_ATTEMPTS} attempts, {problem}: {command}")
 
 
 def append_row(all_data_by_date, date_key, module, row):
@@ -90,7 +129,10 @@ for alias in MINIO_ALIASES:
                 for info in entries:
                     try:
                         fn       = info["key"]
-                        if fn.startswith("ExtentReport-"):
+                        # A DSL run also uploads a -full-error- copy with the same
+                        # counts but no KI or I. It lists first, and the first row
+                        # per date wins, so it would write KI=0.
+                        if fn.startswith("ExtentReport-") or "-full-error-" in fn:
                             continue
                         date_key = date_key_from_minio_ts(info["lastModified"])
                     except (KeyError, ValueError):
