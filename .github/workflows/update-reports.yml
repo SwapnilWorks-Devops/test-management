@@ -273,7 +273,7 @@ jobs:
             exit 0
           fi
 
-          echo "::warning::$REASON"
+          echo "$REASON"
           echo "$REASON" > /tmp/step_failure_reason.txt
           echo "ready=false" >> "$GITHUB_OUTPUT"
 
