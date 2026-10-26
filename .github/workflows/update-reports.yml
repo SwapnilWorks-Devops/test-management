@@ -144,8 +144,7 @@ jobs:
             MATRIX=$(jq -c 'map(.group = "\(.wg)-\(.env)")' <<< "$MATRIX")
           fi
 
-          echo "## WireGuard slots" >> $GITHUB_STEP_SUMMARY
-          jq -r '.[] | "- `\(.env)` -> `\(.wg)`"' <<< "$MATRIX" | tee -a $GITHUB_STEP_SUMMARY
+          jq -r '.[] | "\(.env) -> \(.wg)"' <<< "$MATRIX"
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
 
   # Runs once per env in MINIO_ENVS in parallel — connects to MinIO via WireGuard and generates a CSV
@@ -611,58 +610,83 @@ jobs:
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           DATE=$(date +'%d %b %Y')
 
-          list() { echo "$1" | tr ' ' '\n' | sed '/^$/d' | sed "s/^/$2 \`/" | sed 's/$/`/'; }
-          PASSED_TEXT=$(list "$SUCCESS_ENVS" ":white_check_mark:")
-          PARTIAL_TEXT=$(list "$PARTIAL_ENVS" ":warning:")
-          FAILED_TEXT=$(list "$FAILED_ENVS" ":x:")
           NOTE=""
           if [ -n "$UNWRITTEN_TABS" ]; then
             NOTE="Google Sheet tabs not written: $UNWRITTEN_TABS"
           fi
+          as_json() { jq -nc --arg s "$1" '$s | split(" ") | map(select(. != ""))'; }
 
-          # Slack lays section fields out two per row: Passed | Failed, then Partial below.
-          PAYLOAD=$(jq -n \
+          # Passed | Partial | Failed side by side in a table block. Section fields
+          # cannot do this: Slack always lays them out two per row.
+          TABLE_PAYLOAD=$(jq -n \
             --arg date "$DATE" \
-            --arg passed "${PASSED_TEXT:-(none)}" \
-            --arg partial "${PARTIAL_TEXT:-(none)}" \
-            --arg failed "${FAILED_TEXT:-(none)}" \
+            --argjson passed "$(as_json "$SUCCESS_ENVS")" \
+            --argjson partial "$(as_json "$PARTIAL_ENVS")" \
+            --argjson failed "$(as_json "$FAILED_ENVS")" \
+            --arg note "$NOTE" \
+            --arg url "$RUN_URL" \
+            'def cell($emoji; $text; $style):
+               { type: "rich_text", elements: [{ type: "rich_text_section", elements: [
+                   { type: "emoji", name: $emoji },
+                   { type: "text", text: (" " + $text), style: $style } ] }] };
+             def column($list; $i; $emoji):
+               if $i < ($list | length) then cell($emoji; $list[$i]; { code: true })
+               else { type: "raw_text", text: " " } end;
+             ([$passed, $partial, $failed] | map(length) | max) as $rows
+             | {
+                 text: ("[TEST, fork] MinIO Report — " + $date),
+                 blocks: ([
+                   { type: "header", text: { type: "plain_text", text: ("[TEST, fork] MinIO Report — " + $date), emoji: true } },
+                   { type: "table", rows: (
+                       [[ cell("white_check_mark"; "Passed"; { bold: true }),
+                          cell("warning"; "Partial"; { bold: true }),
+                          cell("x"; "Failed"; { bold: true }) ]]
+                       + [ range(0; $rows) as $i
+                           | [ column($passed; $i; "white_check_mark"),
+                               column($partial; $i; "warning"),
+                               column($failed; $i; "x") ] ]) }
+                 ]
+                 + (if $note != "" then [{ type: "section", text: { type: "mrkdwn", text: (":x: " + $note) } }] else [] end)
+                 + [
+                   { type: "divider" },
+                   { type: "actions", elements: [
+                       { type: "button", text: { type: "plain_text", text: "View Run", emoji: true }, url: $url, style: "primary" } ] }
+                 ])
+               }')
+
+          # If Slack does not accept the table, send the same lists as fields
+          # rather than lose the notification.
+          list() { echo "$1" | tr ' ' '\n' | sed '/^$/d' | sed "s/^/$2 \`/" | sed 's/$/`/'; }
+          FIELDS_PAYLOAD=$(jq -n \
+            --arg date "$DATE" \
+            --arg passed "$(list "$SUCCESS_ENVS" ":white_check_mark:")" \
+            --arg partial "$(list "$PARTIAL_ENVS" ":warning:")" \
+            --arg failed "$(list "$FAILED_ENVS" ":x:")" \
             --arg note "$NOTE" \
             --arg url "$RUN_URL" \
             '{
+              text: ("[TEST, fork] MinIO Report — " + $date),
               blocks: ([
-                {
-                  type: "header",
-                  text: { type: "plain_text", text: ("[TEST, fork] MinIO Report — " + $date), emoji: true }
-                },
-                {
-                  type: "section",
-                  fields: ([
-                    { type: "mrkdwn", text: ("*:white_check_mark: Passed*\n" + $passed) },
-                    { type: "mrkdwn", text: ("*:x: Failed*\n" + $failed) }
-                  ] + (if $partial != "(none)" then [
-                    { type: "mrkdwn", text: ("*:warning: Partial*\n" + $partial) }
-                  ] else [] end))
-                }
+                { type: "header", text: { type: "plain_text", text: ("[TEST, fork] MinIO Report — " + $date), emoji: true } },
+                { type: "section", fields: [
+                    { type: "mrkdwn", text: ("*:white_check_mark: Passed*\n" + (if $passed == "" then "(none)" else $passed end)) },
+                    { type: "mrkdwn", text: ("*:x: Failed*\n" + (if $failed == "" then "(none)" else $failed end)) } ] }
               ]
+              + (if $partial != "" then [{ type: "section", text: { type: "mrkdwn", text: ("*:warning: Partial*\n" + $partial) } }] else [] end)
               + (if $note != "" then [{ type: "section", text: { type: "mrkdwn", text: (":x: " + $note) } }] else [] end)
               + [
                 { type: "divider" },
-                {
-                  type: "actions",
-                  elements: [
-                    {
-                      type: "button",
-                      text: { type: "plain_text", text: "View Run", emoji: true },
-                      url: $url,
-                      style: "primary"
-                    }
-                  ]
-                }
+                { type: "actions", elements: [
+                    { type: "button", text: { type: "plain_text", text: "View Run", emoji: true }, url: $url, style: "primary" } ] }
               ])
             }')
 
-          curl -fsSL -X POST -H 'Content-type: application/json' \
-               --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
+          if ! curl -fsS -X POST -H 'Content-type: application/json' \
+                 --data "$TABLE_PAYLOAD" "$SLACK_WEBHOOK_URL"; then
+            echo "::warning::Slack did not accept the table layout; sent the two-column layout instead."
+            curl -fsSL -X POST -H 'Content-type: application/json' \
+                 --data "$FIELDS_PAYLOAD" "$SLACK_WEBHOOK_URL"
+          fi
 
       - name: Fail if no environment produced reports
         run: |
