@@ -14,6 +14,15 @@ on:
         description: 'TEST HARNESS: JSON array of envs whose DSL listings are made to fail, to show a partial scan'
         required: false
         type: string
+      scripts_ref:
+        description: 'TEST HARNESS: scripts branch to run (test-latest-baseline-scripts = old first-report rule)'
+        required: false
+        type: string
+        default: test-latest-report-scripts
+      report_date:
+        description: 'TEST HARNESS: write this date''s block instead of today''s, e.g. 26-October-2026'
+        required: false
+        type: string
 
 # One run at a time. Envs on the same WireGuard slot are queued by the per-env
 # concurrency group, and GitHub keeps only one pending job per group, so two
@@ -181,7 +190,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v5
         with:
-          ref: test-wg-slots-scripts   # TEST HARNESS: scripts branch pointing at the test sheet
+          ref: ${{ inputs.scripts_ref || 'test-latest-report-scripts' }}   # TEST HARNESS: scripts branch pointing at the test sheet
 
       - name: Reset per-env collected files
         run: |
@@ -300,6 +309,7 @@ jobs:
         run: |
           export MINIO_ENV="${{ matrix.env }}"
           export MINIO_MC_ALIAS="${{ matrix.alias }}"
+          export TEST_REPORT_DATE="${{ inputs.report_date }}"   # TEST HARNESS
           python minio-report-tracker/scripts/update_csv.py
 
       - name: Debug generated outputs
@@ -442,7 +452,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v5
         with:
-          ref: test-wg-slots-scripts   # TEST HARNESS: scripts branch pointing at the test sheet
+          ref: ${{ inputs.scripts_ref || 'test-latest-report-scripts' }}   # TEST HARNESS: scripts branch pointing at the test sheet
 
       - name: Setup Python
         uses: actions/setup-python@v6
