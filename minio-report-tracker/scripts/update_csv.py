@@ -259,6 +259,10 @@ for alias in MINIO_ALIASES:
 
         sorted_dates  = sorted(all_data_by_date.keys(),
                                key=lambda v: datetime.strptime(v, "%d-%B-%Y"), reverse=True)
+        # TEST HARNESS: pretend the scan ran on TEST_REPORT_DATE, so that date's block is written.
+        if os.getenv("TEST_REPORT_DATE"):
+            pinned       = datetime.strptime(os.environ["TEST_REPORT_DATE"], "%d-%B-%Y")
+            sorted_dates = [d for d in sorted_dates if datetime.strptime(d, "%d-%B-%Y") <= pinned]
         weekdays_only = []
         for date_str in sorted_dates:
             if datetime.strptime(date_str, "%d-%B-%Y").weekday() < 5:
