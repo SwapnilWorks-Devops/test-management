@@ -23,6 +23,11 @@ on:
         description: 'TEST HARNESS: write this date''s block instead of today''s, e.g. 26-October-2026'
         required: false
         type: string
+      notify_slack:
+        description: 'TEST HARNESS: post to Slack (off by default so test runs stay out of the channel)'
+        required: false
+        type: boolean
+        default: false
 
 # One run at a time. Envs on the same WireGuard slot are queued by the per-env
 # concurrency group, and GitHub keeps only one pending job per group, so two
@@ -627,7 +632,7 @@ jobs:
           echo "UNWRITTEN_TABS=$(echo $UNWRITTEN)" >> $GITHUB_ENV
 
       - name: Notify Slack
-        if: ${{ always() && (env.FAILED_ENVS != '' || env.PARTIAL_ENVS != '' || env.UNWRITTEN_TABS != '') }}
+        if: ${{ always() && inputs.notify_slack && (env.FAILED_ENVS != '' || env.PARTIAL_ENVS != '' || env.UNWRITTEN_TABS != '') }}   # TEST HARNESS: notify_slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.TEST_AUTOMATION_SLACK_WEBHOOK || secrets.SLACK_WEBHOOK_URL }}  # TEST HARNESS: fork webhook
         run: |
