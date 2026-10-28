@@ -28,6 +28,15 @@ on:
         required: false
         type: boolean
         default: false
+      simulate_schedule:
+        description: 'TEST HARNESS: run the manual-run check as if this were the scheduled run'
+        required: false
+        type: boolean
+        default: false
+      manual_since:
+        description: 'TEST HARNESS: count manual runs created at or after this UTC time (e.g. 2026-10-28T23:00:00Z) instead of midnight IST'
+        required: false
+        type: string
 
 # One run at a time. Envs on the same WireGuard slot are queued by the per-env
 # concurrency group, and GitHub keeps only one pending job per group, so two
@@ -37,6 +46,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+  # GitHub starts the 09:20 IST schedule hours late, usually in the afternoon.
+  # If the workflow was already run by hand that day, the scheduled run is skipped.
+  check-manual-run:
+    name: Check for a manual run today
+    if: github.event_name == 'schedule' || inputs.simulate_schedule
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+
+    steps:
+      - name: Look for a manual run since midnight IST
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SINCE=$(date -u -d "$(TZ=Asia/Kolkata date +%F) 00:00 +0530" +%FT%TZ)
+          SINCE="${{ inputs.manual_since }}"; SINCE=${SINCE:-$(date -u -d "$(TZ=Asia/Kolkata date +%F) 00:00 +0530" +%FT%TZ)}  # TEST HARNESS
+          echo "Manual runs of this workflow created since $SINCE:"
+
+          # Any manual run counts, finished or not. If the runs cannot be
+          # listed, run as usual rather than miss the day.
+          if ! RUNS=$(gh api -X GET "repos/${{ github.repository }}/actions/workflows/update-reports.yml/runs" \
+                        -f event=workflow_dispatch -f created=">=$SINCE" -f per_page=100); then
+            echo "::warning::Could not list today's manual runs, so the scheduled run goes ahead."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          jq -r --argjson self "${{ github.run_id }}" '.workflow_runs[] | select(.id != $self)
+                 | "  #\(.run_number) \(.created_at) by \(.triggering_actor.login): \(.status) \(.conclusion // "")"' <<< "$RUNS"
+          COUNT=$(jq --argjson self "${{ github.run_id }}" '[.workflow_runs[] | select(.id != $self)] | length' <<< "$RUNS")
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::notice::Skipping the scheduled run: the workflow was run manually $COUNT time(s) today."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "  none, so the scheduled run goes ahead."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Validates MINIO_ENVS and derives, per env, the secret-name key and an mc alias.
   # Secret names only allow [A-Z0-9_] and mc aliases must match ^[A-Za-z][A-Za-z0-9_-]*$,
@@ -48,6 +99,9 @@ jobs:
   # over the WIREGUARD_CONF slots that are set: WIREGUARD_CONF, then _1 .. _4.
   plan:
     name: Plan environments
+    needs: check-manual-run
+    # The check only runs on schedule; a manual run skips it and goes ahead.
+    if: ${{ !cancelled() && needs.check-manual-run.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     environment:
       name: daily-automation-reports
@@ -165,7 +219,9 @@ jobs:
   per-env:
     name: "env: ${{ matrix.env }}"
     needs: plan
-    if: needs.plan.outputs.count != '0'
+    # Spelled out because the default success() also requires check-manual-run,
+    # which is skipped on manual runs and would skip this job with it.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
     # A healthy scan takes about two minutes. The cap stops a stuck scan from
     # holding its WireGuard slot, and the env queued behind it, for hours.
@@ -447,9 +503,10 @@ jobs:
   # not, reports the Google Sheets quota, and notifies Slack about partial or failed envs
   summary:
     name: Summary
-    needs: [plan, per-env]
+    needs: [check-manual-run, plan, per-env]
     runs-on: ubuntu-latest
-    if: always()
+    # A skipped scheduled run has nothing to summarise or report to Slack.
+    if: always() && needs.check-manual-run.outputs.skip != 'true'
     environment:
       name: daily-automation-reports
 
