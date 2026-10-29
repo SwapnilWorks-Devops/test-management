@@ -22,6 +22,14 @@ on:
         description: 'TEST HARNESS: JSON array of envs whose DSL listing makes mc exit 1 with nothing on stdout'
         required: false
         type: string
+      truncate_status_envs:
+        description: 'TEST HARNESS: JSON array of envs whose status file is cut short after the scan'
+        required: false
+        type: string
+      multiline_envs:
+        description: 'TEST HARNESS: JSON array of envs whose DSL listing fails with a two-line error message'
+        required: false
+        type: string
       scripts_ref:
         description: 'TEST HARNESS: scripts branch to run (test-latest-baseline-scripts = old first-report rule)'
         required: false
@@ -306,6 +314,24 @@ jobs:
           sudo chmod +x /usr/local/bin/mc
           echo "DSL listings on ${{ matrix.env }} now fail in $MODE mode"
 
+      # TEST HARNESS (fork only): a DSL listing error whose message spans two lines.
+      - name: "TEST HARNESS: two-line mc error on DSL listings"
+        if: contains(fromJson(inputs.multiline_envs || '[]'), matrix.env)
+        run: |
+          sudo mv /usr/local/bin/mc /usr/local/bin/mc.real
+          sudo tee /usr/local/bin/mc > /dev/null <<'EOF'
+          #!/usr/bin/env bash
+          for ARG in "$@"; do
+            case "$ARG" in
+              */dslreports/*)
+                echo '{"status":"error","error":{"message":"Unable to list folder.","cause":{"message":"first line of a simulated error\nsecond line of a simulated error","error":{}}}}'
+                exit 1 ;;
+            esac
+          done
+          exec /usr/local/bin/mc.real "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/mc
+
       # An env that cannot be reached is a result, not a broken workflow: record
       # why, skip the scan, and let the env be reported as failed while the job
       # (and the run) stays green.
@@ -365,6 +391,14 @@ jobs:
           echo ""
           echo "== status payload =="
           cat "../status/status_${{ matrix.env }}.json" || echo "(file not found)"
+
+      # TEST HARNESS (fork only): the status file is cut short, as if the job died mid-write.
+      - name: "TEST HARNESS: truncate the status file"
+        if: contains(fromJson(inputs.truncate_status_envs || '[]'), matrix.env)
+        run: |
+          F="../status/status_${{ matrix.env }}.json"
+          head -c 40 "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+          echo "Truncated $F to: $(cat "$F")"
 
       - name: Collect generated CSV and status files
         if: always()
