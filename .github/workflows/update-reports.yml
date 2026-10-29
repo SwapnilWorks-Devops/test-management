@@ -435,19 +435,26 @@ jobs:
           mkdir -p minio-report-tracker/status
 
           STATE=""; REASON=""; LISTINGS="[]"
+          # A truncated file must not stop the step, or the env would be
+          # reported as cancelled instead of failed.
           if [ -f "$ORIG_STATUS" ]; then
-            STATE=$(jq -r --arg env "$ENV_NAME" '.details[$env].state // ""' "$ORIG_STATUS")
-            REASON=$(jq -r --arg env "$ENV_NAME" '.details[$env].reason // ""' "$ORIG_STATUS")
-            LISTINGS=$(jq -c --arg env "$ENV_NAME" '.details[$env].failed_listings // []' "$ORIG_STATUS")
+            STATE=$(jq -r --arg env "$ENV_NAME" '.details[$env].state // ""' "$ORIG_STATUS" 2>/dev/null || echo "")
+            REASON=$(jq -r --arg env "$ENV_NAME" '.details[$env].reason // ""' "$ORIG_STATUS" 2>/dev/null || echo "")
+            LISTINGS=$(jq -c --arg env "$ENV_NAME" '.details[$env].failed_listings // []' "$ORIG_STATUS" 2>/dev/null || echo "[]")
           fi
           if [ -z "$STATE" ]; then
             STATE=failed
             REASON=$(cat /tmp/step_failure_reason.txt 2>/dev/null || true)
+            if [ -z "$REASON" ] && [ -f "$ORIG_STATUS" ]; then
+              REASON="The scan's status file could not be read."
+            fi
             REASON=${REASON:-"The scan did not finish; see this job's log."}
           elif [ "$STATE" = success ] && [ ! -f "$CSV_FILE" ]; then
             STATE=failed
             REASON="The scan finished but no CSV was collected."
           fi
+          # One line: the reason goes into an ::error:: annotation and a table row.
+          REASON=${REASON//[$'\r\n']/ }
 
           jq -n --arg env "$ENV_NAME" --arg state "$STATE" --arg reason "$REASON" --argjson listings "$LISTINGS" '{
             state: $state, reason: $reason, failed_listings: $listings,
@@ -615,7 +622,10 @@ jobs:
           # MINIO_ENVS entries that never got a job
           if [ "$PLAN_RESULT" != "success" ]; then
             FAILED="$FAILED MINIO_ENVS"
-            ROWS="$ROWS| MINIO_ENVS | :x: failed | not a JSON array of env names, or no WireGuard config |"$'\n'
+            ROWS="$ROWS| MINIO_ENVS | :x: failed | Plan environments failed, so nothing was scanned. Its log says why: MINIO_ENVS is not a JSON array, no WireGuard slot is set, or two slots share a peer. |"$'\n'
+          elif [ "$(jq length <<< "${PLANNED:-[]}")" -eq 0 ] && [ "$(jq length <<< "${INVALID_ENVS:-[]}")" -eq 0 ]; then
+            FAILED="$FAILED MINIO_ENVS"
+            ROWS="$ROWS| MINIO_ENVS | :x: failed | MINIO_ENVS lists no environments, so nothing was scanned. |"$'\n'
           fi
           while IFS=$'\t' read -r INVALID_NAME INVALID_REASON; do
             [ -n "$INVALID_NAME" ] || continue
@@ -700,6 +710,8 @@ jobs:
           } >> $GITHUB_STEP_SUMMARY
           echo "Quota hits: $HITS, waited ${WAITED}s"
           # One line, no stray whitespace: an empty value must stay empty for the Slack condition.
+          # No globbing: Google's error text can hold [429] or *, which must not match file names.
+          set -f
           echo "UNWRITTEN_TABS=$(echo $UNWRITTEN)" >> $GITHUB_ENV
 
       - name: Notify Slack
