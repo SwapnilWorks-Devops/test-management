@@ -30,6 +30,10 @@ on:
         description: 'TEST HARNESS: JSON array of envs whose DSL listing fails with a two-line error message'
         required: false
         type: string
+      slot_fault:
+        description: 'TEST HARNESS: damage WireGuard slots in the plan job only: duplicate, lowercase or garbage'
+        required: false
+        type: string
       scripts_ref:
         description: 'TEST HARNESS: scripts branch to run (test-latest-baseline-scripts = old first-report rule)'
         required: false
@@ -128,6 +132,15 @@ jobs:
           WIREGUARD_CONF_3: ${{ secrets.WIREGUARD_CONF_3 }}
           WIREGUARD_CONF_4: ${{ secrets.WIREGUARD_CONF_4 }}
         run: |
+          # TEST HARNESS (fork only): damage slots here only; env jobs still read the real secrets.
+          case "${{ inputs.slot_fault }}" in
+            duplicate) WIREGUARD_CONF_4="$WIREGUARD_CONF_1" ;;
+            lowercase) WIREGUARD_CONF_1=$(sed 's/^PrivateKey/privatekey/; s/^Address/address/' <<< "$WIREGUARD_CONF_1")
+                       WIREGUARD_CONF_2=$(sed 's/^PrivateKey/privatekey/; s/^Address/address/' <<< "$WIREGUARD_CONF_2") ;;
+            garbage)   WIREGUARD_CONF_3="not a wireguard config"; WIREGUARD_CONF_4="not a wireguard config" ;;
+          esac
+          [ -n "${{ inputs.slot_fault }}" ] && echo "TEST HARNESS: slot fault '${{ inputs.slot_fault }}' applied"
+
           SLOTS=()
           declare -A KEY_OWNER ADDR_OWNER
           for NAME in WIREGUARD_CONF WIREGUARD_CONF_1 WIREGUARD_CONF_2 WIREGUARD_CONF_3 WIREGUARD_CONF_4; do
